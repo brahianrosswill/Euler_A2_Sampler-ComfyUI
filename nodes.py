@@ -231,7 +231,7 @@ class EulerA2Sampler:
                 "normalize_direction": ("BOOLEAN", {"default": False}),
                 "adaptive_scale": ("BOOLEAN", {"default": False}),
                 "seed": ("INT", {
-                    "default": -1, "min": -1, "max": 0xffffffffffffffff
+                    "default": -1, "min": -1, "max": 40000000000,
                 }),
                 "step_start": ("INT", {
                     "default": 0, "min": 0, "max": 10000
