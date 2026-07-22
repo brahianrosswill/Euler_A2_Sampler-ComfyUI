@@ -197,13 +197,23 @@ def _ode_step(
         # Adams-Bashforth 2-step (2nd order, 1 evaluation).
         # Variable-step formula derived from linear interpolation of the
         # derivative between (prev_sigma, prev_derivative) and (sigma_from, d1).
-        if prev_derivative is None or prev_sigma is None or abs(sigma_from - prev_sigma) < _EPS:
-            # Fallback to Euler on first step or when previous data is missing/invalid.
+        if prev_derivative is None or prev_sigma is None:
+            # Fallback to Euler on first step or when previous data is missing.
             return x + h * d1, None
         h_prev = sigma_from - prev_sigma
-        # Coefficients from integrating the linear interpolant.
-        c1 = 1.0 + h / (2.0 * h_prev)
-        c2 = h / (2.0 * h_prev)
+        if abs(h_prev) < _EPS:
+            # Consecutive steps at nearly identical sigma: avoid division by zero.
+            # Treat as repeated evaluation and use average derivative.
+            d_avg = 0.5 * (d1 + prev_derivative)
+            return x + h * d_avg, None
+        # Standard AB2 coefficients for variable step size.
+        # From integrating the linear interpolant of f(σ) between σ_{n-1} and σ_n:
+        #   x_{n+1} = x_n + ∫_{σ_n}^{σ_{n+1}} [d1 + (d1 - prev_d)/(h_prev) * (σ - σ_n)] dσ
+        #           = x_n + h * d1 + h²/(2*h_prev) * (d1 - prev_d)
+        #           = x_n + h * [(1 + h/(2*h_prev)) * d1 - (h/(2*h_prev)) * prev_d]
+        ratio = h / (2.0 * h_prev)
+        c1 = 1.0 + ratio
+        c2 = ratio
         return x + h * (c1 * d1 - c2 * prev_derivative), None
 
     if method == "midpoint":
