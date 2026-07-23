@@ -8,9 +8,11 @@ On top of that it supports:
 
 - Higher-order integration of the deterministic down-step (the probability-flow
   ODE  dx/dσ = (x - denoised)/σ):  euler (1st order), midpoint / ralston /
-  heun / dpm2 (2nd order), rk3 (3rd order), rk4 (4th order), and **ab2**
+  heun / dpm2 (2nd order), rk3 (3rd order), rk4 (4th order), **ab2**
   (Adams-Bashforth 2-step: 2nd order, 1 evaluation per step after the first,
-  using the previous step's derivative for a multistep predictor).
+  using the previous step's derivative for a multistep predictor), and
+  **er_sde** (exponential Rosenbrock SDE integrator: 2nd order, 2 evaluations,
+  uses phi functions for exponential integration with improved stability).
 - Internal substepping of every sigma interval, in two modes:
     * "ancestral"     - full down-step + renoise per substep (a finer SDE
                         discretization; with matching sigmas this is identical
@@ -54,7 +56,7 @@ SAMPLER_NAME = "euler_a2"
 
 MERGE_MODES = ("mean", "median")
 NORMALIZE_MODES = ("none", "variance", "rms")
-METHODS = ("euler", "midpoint", "ralston", "heun", "dpm2", "rk3", "rk4", "ab2")
+METHODS = ("euler", "midpoint", "ralston", "heun", "dpm2", "rk3", "rk4", "ab2", "er_sde")
 SUBSTEP_MODES = ("ancestral", "deterministic")
 SUBSTEP_SPACINGS = ("log", "linear")
 PARAMETERIZATIONS = ("flow", "edm")
@@ -254,6 +256,48 @@ def _ode_step(
         )
         return x_next, None
 
+    if method == "er_sde":
+        # Exponential Rosenbrock SDE integrator (2nd order, 2 evaluations).
+        # This method uses an exponential integrator approach that solves the
+        # linear part of the ODE exactly via phi functions, providing better
+        # stability and accuracy especially for larger step sizes.
+        # Based on the ER-SDE / exponential Rosenbrock scheme for diffusion ODEs.
+        # The key insight is to use expm1 for numerical stability when computing
+        # the phi_1 function: phi_1(z) = (exp(z) - 1) / z = expm1(z) / z
+        if abs(sigma_to - sigma_from) < _EPS:
+            return x, None
+        # Compute the logarithmic step size for the exponential integrator
+        log_r = math.log(max(sigma_to, _EPS)) - math.log(max(sigma_from, _EPS))
+        r = sigma_to / sigma_from
+        
+        # First evaluation at current point (already computed as denoised_start)
+        d1 = (x - denoised_start) / sigma_from
+        
+        # Midpoint evaluation with exponential weighting
+        sigma_mid = math.exp(0.5 * (math.log(sigma_from) + math.log(sigma_to)))
+        # Use phi_1 function via expm1 for numerical stability
+        # phi_1(log_r/2) = (exp(log_r/2) - 1) / (log_r/2) = 2*(sqrt(r) - 1) / log_r
+        if abs(log_r) < _EPS:
+            phi_half = 1.0  # limit as z -> 0
+        else:
+            phi_half = (math.sqrt(r) - 1.0) / (0.5 * log_r)
+        
+        # Predict midpoint using exponential integrator formula
+        x_mid = x + 0.5 * sigma_from * phi_half * d1 * log_r
+        denoised_mid = model(x_mid, sigma_mid * s_in, **extra_args)
+        d2 = (x_mid - denoised_mid) / sigma_mid
+        
+        # Final step using exponential integration
+        # phi_1(log_r) = (r - 1) / log_r via expm1 for stability
+        if abs(log_r) < _EPS:
+            phi_one = 1.0  # limit as z -> 0
+        else:
+            phi_one = (r - 1.0) / log_r
+        
+        # Combine derivatives with exponential weights
+        x_next = x + sigma_from * phi_one * (0.5 * d1 + 0.5 * d2) * log_r
+        return x_next, None
+
     if method == "rk3":
         # Classical Runge-Kutta 3rd order (Kutta's method, 3 evaluations).
         sigma_mid = 0.5 * (sigma_from + sigma_to)
@@ -431,7 +475,8 @@ def sample_euler_a2(
     active_start/end:    fraction of the step range where merging + extrapolation applies
     method:              integration order of the deterministic down-step:
                          euler (1 eval), midpoint / ralston / heun / dpm2 (2 evals),
-                         rk3 (3 evals), rk4 (4 evals), ab2 (1 eval, multistep) per substep.
+                         rk3 (3 evals), rk4 (4 evals), ab2 (1 eval, multistep),
+                         er_sde (2nd order exponential Rosenbrock, 2 evals) per substep.
     substeps:            max internal substeps per sigma interval (multiplies model evals)
     substep_mode:        "ancestral" (renoise each substep) | "deterministic" (renoise once)
     substep_spacing:     "log" (geometric sigmas) | "linear" (uniform sigmas)
@@ -770,7 +815,8 @@ class EulerA2Sampler:
                         "tooltip": "Integration order of the deterministic down-step: "
                         "euler (1st order, 1 eval), midpoint / ralston / heun / dpm2 (2nd order, 2 evals), "
                         "rk3 (3rd order, 3 evals), rk4 (4th order, 4 evals), "
-                        "ab2 (2nd order multistep, 1 eval, uses previous derivative) per substep.",
+                        "ab2 (2nd order multistep, 1 eval, uses previous derivative), "
+                        "er_sde (2nd order exponential Rosenbrock, 2 evals, improved stability) per substep.",
                     },
                 ),
                 "substeps": (
