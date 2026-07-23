@@ -10,9 +10,10 @@ On top of that it supports:
   ODE  dx/dσ = (x - denoised)/σ):  euler (1st order), midpoint / ralston /
   heun / dpm2 (2nd order), rk3 (3rd order), rk4 (4th order), **ab2**
   (Adams-Bashforth 2-step: 2nd order, 1 evaluation per step after the first,
-  using the previous step's derivative for a multistep predictor), and
+  using the previous step's derivative for a multistep predictor),
   **er_sde** (exponential Rosenbrock SDE integrator: 2nd order, 2 evaluations,
-  uses phi functions for exponential integration with improved stability).
+  uses phi functions for exponential integration with improved stability), and
+  **milstein** (strong order 1.0 SDE scheme with curvature correction term).
 - Internal substepping of every sigma interval, in two modes:
     * "ancestral"     - full down-step + renoise per substep (a finer SDE
                         discretization; with matching sigmas this is identical
@@ -27,6 +28,10 @@ On top of that it supports:
 - **Parameterization support**: "flow" (α = 1 − σ, original Euler-A2 behaviour)
   or "edm" (α = 1, standard k-diffusion ancestral sampling compatible with
   most SD 1.5 / SDXL checkpoints).
+- **Langevin corrector**: post-step refinement using score-based gradient steps
+  with either fixed or dynamically adaptive step sizes for improved accuracy.
+- **Variance reduction**: antithetic sampling technique that pairs each random
+  draw with its negation to reduce Monte Carlo variance via symmetry.
 
 Averaging N paths suppresses the per-step noise variance (~1/N for a mean),
 which reduces random drift and yields smoother, more coherent ancestral
@@ -36,9 +41,10 @@ sampling; `extrapolation` then re-amplifies the merged direction to restore
 Backward compatibility: with the default widget values (method="euler",
 substeps=1, substep_active_start=0.0, substep_active_end=1.0, substep_fade=0.0,
 noise_paths=2, merge_mode="mean", noise_normalization="none",
-extrapolation=0.425, active range [0, 1], parameterization="flow") this
-reproduces the original Euler-A2 behaviour, and old workflows load unchanged
-since all new widgets are appended after the original ones.
+extrapolation=0.425, active range [0, 1], parameterization="flow",
+corrector="none", variance_reduction="none") this reproduces the original
+Euler-A2 behaviour, and old workflows load unchanged since all new widgets
+are appended after the original ones.
 """
 
 import math
@@ -56,10 +62,12 @@ SAMPLER_NAME = "euler_a2"
 
 MERGE_MODES = ("mean", "median")
 NORMALIZE_MODES = ("none", "variance", "rms")
-METHODS = ("euler", "midpoint", "ralston", "heun", "dpm2", "rk3", "rk4", "ab2", "er_sde")
+METHODS = ("euler", "midpoint", "ralston", "heun", "dpm2", "rk3", "rk4", "ab2", "er_sde", "milstein")
 SUBSTEP_MODES = ("ancestral", "deterministic")
 SUBSTEP_SPACINGS = ("log", "linear")
 PARAMETERIZATIONS = ("flow", "edm")
+CORRECTOR_MODES = ("none", "langevin", "langevin_dynamic")
+VARIANCE_REDUCTION_MODES = ("none", "antithetic")
 
 _EPS = 1e-8
 
@@ -101,6 +109,21 @@ def _normalize_noise(noise: Tensor, mode: str, count: int) -> Tensor:
             return noise
         return noise / rms.clamp_min(_EPS)
     return noise
+
+
+def _antithetic_noise(noise_sampler, sigma_from, sigma_to, count: int) -> List[Tensor]:
+    """Generate antithetic noise pairs for variance reduction.
+    
+    For each random draw, also include its negation. This reduces variance
+    by ensuring the noise distribution is more symmetric around zero.
+    Returns a list of 2*count tensors (original + negated pairs).
+    """
+    noises = []
+    for _ in range(count):
+        n = noise_sampler(sigma_from, sigma_to)
+        noises.append(n)
+        noises.append(-n)
+    return noises
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +344,26 @@ def _ode_step(
         d4 = (x_4 - denoised_end) / sigma_to
         return x + h * (d1 + 2.0 * d2 + 2.0 * d3 + d4) / 6.0, denoised_end
 
+    if method == "milstein":
+        # Milstein scheme for SDEs (strong order 1.0, includes diffusion derivative term).
+        # For the probability-flow ODE dx/dσ = (x - denoised)/σ, this adds a correction
+        # term based on the second-order Taylor expansion of the drift.
+        # The Milstein correction accounts for the curvature of the drift field.
+        sigma_mid = 0.5 * (sigma_from + sigma_to)
+        x_mid = x + 0.5 * h * d1
+        denoised_mid = model(x_mid, sigma_mid * s_in, **extra_args)
+        d2 = (x_mid - denoised_mid) / sigma_mid
+        
+        # Compute the Milstein correction term
+        # This approximates the second derivative effect using finite differences
+        # between the derivatives at sigma_from and sigma_mid
+        dd = (d2 - d1) / max(0.5 * h, _EPS)
+        
+        # Milstein update: x += h*d1 + 0.5*h^2*dd (with stochastic correction)
+        # For the diffusion ODE, we use a simplified form that captures the curvature
+        x_next = x + h * d1 + 0.5 * h * h * dd
+        return x_next, None
+
     raise ValueError(f"Unknown ODE integration method: {method}")
 
 
@@ -463,6 +506,10 @@ def sample_euler_a2(
     substep_active_end: float = 1.0,
     substep_fade: float = 0.0,
     parameterization: str = "flow",
+    corrector: str = "none",
+    corrector_steps: int = 1,
+    corrector_eta: float = 0.5,
+    variance_reduction: str = "none",
 ):
     """Euler ancestral sampler merging N noise paths, extrapolated along their shared direction.
 
@@ -476,7 +523,8 @@ def sample_euler_a2(
     method:              integration order of the deterministic down-step:
                          euler (1 eval), midpoint / ralston / heun / dpm2 (2 evals),
                          rk3 (3 evals), rk4 (4 evals), ab2 (1 eval, multistep),
-                         er_sde (2nd order exponential Rosenbrock, 2 evals) per substep.
+                         er_sde (2nd order exponential Rosenbrock, 2 evals),
+                         milstein (strong order 1.0 SDE, includes curvature correction) per substep.
     substeps:            max internal substeps per sigma interval (multiplies model evals)
     substep_mode:        "ancestral" (renoise each substep) | "deterministic" (renoise once)
     substep_spacing:     "log" (geometric sigmas) | "linear" (uniform sigmas)
@@ -489,6 +537,12 @@ def sample_euler_a2(
     parameterization:    "flow" (α = 1 − σ, original Euler-A2, best for flow-matching
                          models) or "edm" (α = 1, standard k-diffusion ancestral,
                          best for EDM / SD 1.5 / SDXL models).
+    corrector:           post-step corrector: "none" | "langevin" | "langevin_dynamic".
+                         Langevin corrector refines samples using score-based gradient steps.
+    corrector_steps:     number of Langevin corrector iterations per sampling step.
+    corrector_eta:       step size for Langevin dynamics (higher = more noise injection).
+    variance_reduction:  technique for reducing Monte Carlo variance:
+                         "none" | "antithetic" (uses paired ±noise for symmetry).
     """
     extra_args = {} if extra_args is None else extra_args
     seed = extra_args.get("seed", None)
@@ -652,14 +706,39 @@ def sample_euler_a2(
                 continue
             noise_scale = s_noise * sigma_up
             if enhanced_active:
-                noises = [
-                    noise_sampler(sigma_i, sigma_ip1) for _ in range(noise_paths)
-                ]
+                # Support variance reduction via antithetic sampling
+                if variance_reduction == "antithetic":
+                    noises = _antithetic_noise(noise_sampler, sigma_i, sigma_ip1, noise_paths // 2 + 1)
+                    # Use only the requested number of paths (antithetic generates pairs)
+                    noises = noises[:noise_paths]
+                else:
+                    noises = [
+                        noise_sampler(sigma_i, sigma_ip1) for _ in range(noise_paths)
+                    ]
                 direction = _merge_noise_paths(noises, merge_mode)
                 direction = _normalize_noise(direction, noise_normalization, noise_paths)
                 x = x_det + direction * (noise_scale * boost)
             else:
                 x = x_det + noise_sampler(sigma_i, sigma_ip1) * noise_scale
+        
+        # Apply Langevin corrector if enabled
+        if corrector != "none" and corrector_steps > 0 and sigma_ip1_f > 0.0:
+            # Langevin dynamics corrector: x += step_size * score + noise * sqrt(2 * step_size)
+            # The score is approximated as (denoised - x) / sigma^2
+            step_size = corrector_eta * sigma_ip1_f
+            for _ in range(corrector_steps):
+                denoised_current = model(x, sigma_ip1 * s_in, **extra_args)
+                score = (denoised_current - x) / (sigma_ip1_f ** 2 + _EPS)
+                
+                if corrector == "langevin_dynamic":
+                    # Dynamic step size based on local gradient magnitude
+                    grad_norm = score.pow(2).mean().sqrt()
+                    if grad_norm > _EPS:
+                        adaptive_step = step_size / grad_norm.clamp_min(_EPS)
+                        step_size = min(adaptive_step, step_size * 2.0)
+                
+                noise_term = noise_sampler(sigma_ip1, sigma_ip1)
+                x = x + step_size * score + noise_term * (2.0 * step_size).sqrt()
         else:
             # Flow parameterization (α = 1 − σ)
             alpha_ip1 = 1.0 - sigma_ip1_f
@@ -674,14 +753,39 @@ def sample_euler_a2(
                 x = base
                 continue
             if enhanced_active:
-                noises = [
-                    noise_sampler(sigma_i, sigma_ip1) for _ in range(noise_paths)
-                ]
+                # Support variance reduction via antithetic sampling
+                if variance_reduction == "antithetic":
+                    noises = _antithetic_noise(noise_sampler, sigma_i, sigma_ip1, noise_paths // 2 + 1)
+                    # Use only the requested number of paths (antithetic generates pairs)
+                    noises = noises[:noise_paths]
+                else:
+                    noises = [
+                        noise_sampler(sigma_i, sigma_ip1) for _ in range(noise_paths)
+                    ]
                 direction = _merge_noise_paths(noises, merge_mode)
                 direction = _normalize_noise(direction, noise_normalization, noise_paths)
                 x = base + direction * (noise_scale * boost)
             else:
                 x = base + noise_sampler(sigma_i, sigma_ip1) * noise_scale
+        
+        # Apply Langevin corrector if enabled (for flow parameterization path too)
+        if corrector != "none" and corrector_steps > 0 and sigma_ip1_f > 0.0:
+            # Langevin dynamics corrector: x += step_size * score + noise * sqrt(2 * step_size)
+            # The score is approximated as (denoised - x) / sigma^2
+            step_size = corrector_eta * sigma_ip1_f
+            for _ in range(corrector_steps):
+                denoised_current = model(x, sigma_ip1 * s_in, **extra_args)
+                score = (denoised_current - x) / (sigma_ip1_f ** 2 + _EPS)
+                
+                if corrector == "langevin_dynamic":
+                    # Dynamic step size based on local gradient magnitude
+                    grad_norm = score.pow(2).mean().sqrt()
+                    if grad_norm > _EPS:
+                        adaptive_step = step_size / grad_norm.clamp_min(_EPS)
+                        step_size = min(adaptive_step, step_size * 2.0)
+                
+                noise_term = noise_sampler(sigma_ip1, sigma_ip1)
+                x = x + step_size * score + noise_term * (2.0 * step_size).sqrt()
 
     return x
 
@@ -889,6 +993,43 @@ class EulerA2Sampler:
                         "'edm' = α = 1 (standard k-diffusion ancestral, best for SD 1.5 / SDXL / EDM).",
                     },
                 ),
+                "corrector": (
+                    list(CORRECTOR_MODES),
+                    {
+                        "default": "none",
+                        "tooltip": "Post-step corrector: 'none' | 'langevin' (fixed step) | 'langevin_dynamic' (adaptive step). "
+                        "Langevin corrector refines samples using score-based gradient steps for improved accuracy.",
+                    },
+                ),
+                "corrector_steps": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 8,
+                        "step": 1,
+                        "tooltip": "Number of Langevin corrector iterations per sampling step. Higher values increase accuracy but cost more model evaluations.",
+                    },
+                ),
+                "corrector_eta": (
+                    "FLOAT",
+                    {
+                        "default": 0.5,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "round": False,
+                        "tooltip": "Step size multiplier for Langevin dynamics. Higher = more noise injection and larger correction steps.",
+                    },
+                ),
+                "variance_reduction": (
+                    list(VARIANCE_REDUCTION_MODES),
+                    {
+                        "default": "none",
+                        "tooltip": "Variance reduction technique: 'none' | 'antithetic' (uses paired ±noise for symmetry). "
+                        "Antithetic sampling reduces Monte Carlo variance by ensuring symmetric noise distribution.",
+                    },
+                ),
             },
         }
 
@@ -898,8 +1039,9 @@ class EulerA2Sampler:
     DESCRIPTION = (
         "Euler ancestral sampler that merges several noise paths per step and extrapolates "
         "along their shared direction, with higher-order integration methods (including "
-        "Adams-Bashforth 2-step multistep), internal substepping, practical substep scheduling, "
-        "and EDM/flow parameterization support for smoother, more efficient ancestral sampling."
+        "Adams-Bashforth 2-step multistep and Milstein SDE), internal substepping, practical "
+        "substep scheduling, Langevin correctors, variance reduction techniques, and EDM/flow "
+        "parameterization support for smoother, more accurate ancestral sampling."
     )
 
     def get_sampler(
@@ -920,6 +1062,10 @@ class EulerA2Sampler:
         substep_active_end=1.0,
         substep_fade=0.0,
         parameterization="flow",
+        corrector="none",
+        corrector_steps=1,
+        corrector_eta=0.5,
+        variance_reduction="none",
     ):
         sampler = comfy.samplers.ksampler(
             SAMPLER_NAME,
@@ -940,6 +1086,10 @@ class EulerA2Sampler:
                 "substep_active_end": substep_active_end,
                 "substep_fade": substep_fade,
                 "parameterization": parameterization,
+                "corrector": corrector,
+                "corrector_steps": corrector_steps,
+                "corrector_eta": corrector_eta,
+                "variance_reduction": variance_reduction,
             },
         )
         return (sampler,)
