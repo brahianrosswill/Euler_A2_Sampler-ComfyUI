@@ -702,10 +702,27 @@ def _apply_langevin_corrector(
 
     Score approximation:
         score = (denoised - x) / sigma^2
+    
+    Args:
+        model: Denoiser model
+        x: Current sample
+        sigma: Noise level as a float (used for step size calculation)
+        sigma_tensor: Noise level as a tensor (passed to noise_sampler for compatibility)
+        s_in: Scaling factor for sigma
+        extra_args: Additional arguments for the model
+        noise_sampler: Function to generate noise
+        corrector: Corrector mode ('none', 'langevin', 'langevin_dynamic')
+        corrector_steps: Number of corrector iterations
+        corrector_eta: Base step size multiplier
+    
+    Returns:
+        Corrected sample tensor
     """
     corrector = _strip_str(corrector)
 
-    if corrector == "none" or corrector_steps <= 0 or sigma <= 0.0:
+    # Skip corrector if disabled, no steps requested, or sigma is too small
+    # At very low sigma values, the score becomes numerically unstable
+    if corrector == "none" or corrector_steps <= 0 or sigma <= _EPS:
         return x
 
     base_step_size = float(corrector_eta) * float(sigma)
@@ -722,7 +739,14 @@ def _apply_langevin_corrector(
                 adaptive_step = base_step_size / grad_norm
                 step_size = min(adaptive_step, base_step_size * 2.0)
 
-        noise_term = noise_sampler(sigma_tensor, sigma_tensor)
+        # Ensure sigma_tensor is a proper tensor for noise_sampler compatibility
+        # Convert 0-d tensors to floats for consistent behavior across all callers
+        if isinstance(sigma_tensor, torch.Tensor) and sigma_tensor.ndim == 0:
+            sigma_for_noise = float(sigma_tensor)
+        else:
+            sigma_for_noise = sigma_tensor
+        
+        noise_term = noise_sampler(sigma_for_noise, sigma_for_noise)
         noise_scale = math.sqrt(max(2.0 * step_size, 0.0))
 
         x = x + step_size * score + noise_term * noise_scale
