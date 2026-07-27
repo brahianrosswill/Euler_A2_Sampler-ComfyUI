@@ -206,7 +206,7 @@ def _effective_substeps(
 
     active_range = active_end - active_start
     if active_range <= 0.0:
-        return substeps
+        return 1
 
     fade = min(fade, 0.5)
     fade_width = fade * active_range
@@ -341,6 +341,9 @@ def _ode_step(
 
     if method == "midpoint":
         sigma_mid = 0.5 * (sigma_from + sigma_to)
+        # Protect against division by near-zero sigma_mid
+        if sigma_mid < _EPS:
+            return x, None
         x_mid = x + (sigma_mid - sigma_from) * d1
         denoised_mid = model(x_mid, sigma_mid * s_in, **extra_args)
         d2 = (x_mid - denoised_mid) / sigma_mid
@@ -349,12 +352,18 @@ def _ode_step(
     if method == "ralston":
         # Ralston's 2nd-order method.
         sigma_r = sigma_from + (2.0 / 3.0) * h
+        # Protect against division by near-zero sigma_r
+        if sigma_r < _EPS:
+            return x, None
         x_r = x + (2.0 / 3.0) * h * d1
         denoised_r = model(x_r, sigma_r * s_in, **extra_args)
         d2 = (x_r - denoised_r) / sigma_r
         return x + h * (0.25 * d1 + 0.75 * d2), None
 
     if method == "heun":
+        # Protect against division by near-zero sigma_to
+        if sigma_to < _EPS:
+            return x, None
         x_end = x + h * d1
         denoised_end = model(x_end, sigma_to * s_in, **extra_args)
         d2 = (x_end - denoised_end) / sigma_to
@@ -363,6 +372,9 @@ def _ode_step(
     if method == "dpm2":
         # DPM-Solver-2 data-prediction variant.
         sigma_mid = (sigma_from * sigma_to) ** 0.5
+        # Protect against division by near-zero sigma_mid
+        if sigma_mid < _EPS:
+            return x, None
         r_mid = sigma_mid / sigma_from
         x_mid = r_mid * x + (1.0 - r_mid) * denoised_start
 
@@ -386,7 +398,8 @@ def _ode_step(
 
         d1 = (x - denoised_start) / sigma_from
 
-        sigma_mid = math.exp(0.5 * (math.log(sigma_from) + math.log(sigma_to)))
+        # Use protected logs to avoid crash when sigma is zero or negative.
+        sigma_mid = math.exp(0.5 * (math.log(max(sigma_from, _EPS)) + math.log(max(sigma_to, _EPS))))
 
         if abs(log_r) < _EPS:
             phi_half = 1.0
@@ -395,6 +408,11 @@ def _ode_step(
 
         x_mid = x + 0.5 * sigma_from * phi_half * d1 * log_r
         denoised_mid = model(x_mid, sigma_mid * s_in, **extra_args)
+        
+        # Protect division by sigma_mid
+        if sigma_mid < _EPS:
+            return x, None
+            
         d2 = (x_mid - denoised_mid) / sigma_mid
 
         if abs(log_r) < _EPS:
@@ -408,6 +426,9 @@ def _ode_step(
     if method == "rk3":
         # Classical Runge-Kutta 3rd order.
         sigma_mid = 0.5 * (sigma_from + sigma_to)
+        # Protect against division by near-zero sigma_mid or sigma_to
+        if sigma_mid < _EPS or sigma_to < _EPS:
+            return x, None
 
         x_2 = x + 0.5 * h * d1
         denoised_2 = model(x_2, sigma_mid * s_in, **extra_args)
@@ -422,6 +443,9 @@ def _ode_step(
     if method == "rk4":
         # Classical Runge-Kutta 4th order.
         sigma_mid = 0.5 * (sigma_from + sigma_to)
+        # Protect against division by near-zero sigma_mid or sigma_to
+        if sigma_mid < _EPS or sigma_to < _EPS:
+            return x, None
 
         x_2 = x + (sigma_mid - sigma_from) * d1
         d2 = (x_2 - model(x_2, sigma_mid * s_in, **extra_args)) / sigma_mid
