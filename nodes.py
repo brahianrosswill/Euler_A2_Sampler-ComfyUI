@@ -294,7 +294,12 @@ def _ode_step(
     if sigma_from <= _EPS:
         return x, None
 
-    if method == "euler" or sigma_to <= _EPS or abs(sigma_to - sigma_from) < _EPS:
+    # Handle edge cases where no meaningful integration can occur.
+    if sigma_to <= _EPS or abs(sigma_to - sigma_from) < _EPS:
+        r = sigma_to / sigma_from if sigma_to > 0.0 else 0.0
+        return r * x + (1.0 - r) * denoised_start, None
+
+    if method == "euler":
         r = sigma_to / sigma_from if sigma_to > 0.0 else 0.0
         return r * x + (1.0 - r) * denoised_start, None
 
