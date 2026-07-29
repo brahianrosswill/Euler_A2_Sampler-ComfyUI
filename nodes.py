@@ -376,10 +376,10 @@ def _ode_step(
         # Using a linear model: D_end ≈ D_start + alpha * (x_pred - x)
         # where alpha captures the sensitivity of the denoiser to input changes.
         # 
-        # For diffusion models, alpha typically ranges from 0.5 to 0.9 depending
+        # For diffusion models, alpha typically ranges from 0.3 to 0.7 depending
         # on the noise level. We use an adaptive schedule:
-        # - High noise (large sigma): alpha ~ 0.5 (denoiser is less sensitive)
-        # - Low noise (small sigma): alpha ~ 0.9 (denoiser tracks input more closely)
+        # - High noise (large sigma): alpha ~ 0.3 (denoiser is less sensitive)
+        # - Low noise (small sigma): alpha ~ 0.7 (denoiser tracks input more closely)
         #
         # This adaptive estimation accounts for the changing nature of the denoiser
         # across different noise levels, making the method robust to any scheduler.
@@ -388,24 +388,32 @@ def _ode_step(
         # Adaptive alpha based on relative step position in the diffusion process
         # sigma_from represents the current noise level
         # Typical sigma range: 0.001 to 10+ depending on scheduler
-        if sigma_from > 1.0:
-            alpha = 0.5  # High noise regime
-        elif sigma_from < 0.1:
-            alpha = 0.9  # Low noise regime
+        # Use smoother interpolation that stays within bounds
+        if sigma_from > 2.0:
+            alpha = 0.3  # High noise regime
+        elif sigma_from < 0.05:
+            alpha = 0.7  # Low noise regime
         else:
-            # Smooth interpolation for mid-range
-            alpha = 0.5 + 0.4 * (1.0 - math.log10(max(sigma_from, _EPS)) / math.log10(10.0))
-            alpha = max(0.5, min(0.9, alpha))
+            # Smooth logarithmic interpolation for mid-range
+            # Map sigma_from from [0.05, 2.0] to [0.7, 0.3]
+            log_sigma = math.log(max(sigma_from, _EPS))
+            log_lo = math.log(0.05)
+            log_hi = math.log(2.0)
+            t = (log_sigma - log_lo) / (log_hi - log_lo)
+            t = max(0.0, min(1.0, t))
+            alpha = 0.7 - 0.4 * t
         
-        # Estimate denoised at end point
+        # Estimate denoised at end point with conservative scaling
         estimated_denoised_end = denoised_start + alpha * delta_x
         
         # Compute estimated derivative at end point
         d2_est = (x_pred - estimated_denoised_end) / sigma_to
         
         # Heun-style update: average of derivatives at start and estimated end
-        # This provides second-order accuracy when D varies
-        x_next = x + 0.5 * h * (d1 + d2_est)
+        # Apply under-relaxation factor to prevent overshooting and preserve detail
+        # Standard Heun uses 0.5, but we reduce it slightly to maintain sharpness
+        relaxation = 0.4
+        x_next = x + h * ((1.0 - relaxation) * d1 + relaxation * d2_est)
         
         return x_next, None
 
