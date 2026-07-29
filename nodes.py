@@ -20,6 +20,8 @@ Higher-order integration of the deterministic down-step:
     er_sde             exponential Rosenbrock-style SDE/ODE integrator, 2 evaluations
     dpmpp_2m           DPM-Solver++ 2M multistep exponential integrator,
                        1 evaluation per step after warm-up
+    dpmpp_2m_stable    stabilized variant with adaptive damping to reduce
+                       oversaturation and color shifts
 
 The previous heuristic `milstein` method has been replaced by `dpmpp_2m`.
 Old workflows using `milstein` are automatically migrated to `dpmpp_2m`.
@@ -81,6 +83,7 @@ METHODS = (
     "ab2",
     "er_sde",
     "dpmpp_2m",
+    "dpmpp_2m_stable",
 )
 SUBSTEP_MODES = ("ancestral", "deterministic")
 SUBSTEP_SPACINGS = ("log", "linear")
@@ -98,6 +101,49 @@ def _compat_method(method: str) -> str:
     if method == "milstein":
         return "dpmpp_2m"
     return method
+
+
+def _clamp_correction_factor(corr: float, h_log: float, h_prev: float) -> float:
+    """Clamp the correction factor to prevent overshooting and oversaturation.
+    
+    The DPM-Solver++ 2M correction term can become unstable when:
+    - Step sizes vary significantly between consecutive steps
+    - The denoised predictions change rapidly (high-frequency content)
+    - sigma is in critical mid-range values where structure forms
+    
+    The full correction coefficient is (corr / h_prev), which can become
+    excessively large when h_prev << h_log (e.g., after warmup or with
+    non-uniform step schedules). This function clamps the effective
+    coefficient to maintain stability.
+    
+    Args:
+        corr: The raw correction coefficient (h - expm1(h))
+        h_log: The current log step size (log(sigma_to/sigma_from))
+        h_prev: The previous log step size (log(sigma_from/sigma_prev))
+    
+    Returns:
+        Clamped correction coefficient with bounded influence
+    """
+    if abs(h_prev) < 1e-6:
+        return corr
+    
+    # Calculate the full coefficient that will be applied
+    coeff = corr / h_prev
+    
+    # Target: |coeff| should be ~|h|/2 for second-order accuracy
+    # Allow margin up to 0.6*|h| but prevent runaway amplification
+    max_coeff = 0.6 * abs(h_log)
+    
+    # Clamp the coefficient to prevent excessive correction
+    coeff = max(-max_coeff, min(max_coeff, coeff))
+    
+    # Additional smooth damping for very large steps where linear
+    # assumptions break down and higher-order terms dominate
+    if abs(h_log) > 0.5:
+        damping = 0.8 / abs(h_log)
+        coeff *= damping
+    
+    return coeff * h_prev
 
 
 def _strip_str(value):
@@ -550,6 +596,70 @@ def _ode_step(
         x_next = r * x + (1.0 - r) * denoised_start + correction
         return x_next, None
 
+    if method == "dpmpp_2m_stable":
+        # DPM-Solver++ 2M-style multistep exponential integrator with stability improvements.
+        #
+        # This variant addresses oversaturation and color shift issues in the standard
+        # dpmpp_2m by applying adaptive damping to the correction term.
+        #
+        # Work in t = log(sigma). The ODE becomes:
+        #   dx/dt = x - D(x, sigma)
+        #
+        # If D is constant:
+        #   x_next = r*x + (1-r)*D_start
+        #
+        # If D is linear in t, using the previous denoised prediction to
+        # estimate dD/dt, the exact integrated correction is:
+        #   correction = ((h + 1 - r) / h_prev) * (D_start - D_prev)
+        #
+        # where:
+        #   h = log(sigma_to / sigma_from)
+        #   h_prev = log(sigma_from / sigma_prev)
+        #   r = sigma_to / sigma_from
+        #
+        # Stability improvements:
+        # 1. Adaptive clamping of the correction coefficient based on step size
+        # 2. Additional damping for large steps where linear assumption breaks down
+        # 3. Bounded influence to prevent error accumulation and overshooting
+        r = sigma_to / sigma_from
+
+        if (
+            prev_denoised is None
+            or prev_denoised_sigma is None
+            or float(prev_denoised_sigma) <= _EPS
+        ):
+            return r * x + (1.0 - r) * denoised_start, None
+
+        log_from = math.log(max(sigma_from, _EPS))
+        log_to = math.log(max(sigma_to, _EPS))
+        log_prev = math.log(max(float(prev_denoised_sigma), _EPS))
+
+        h_log = log_to - log_from
+        h_prev = log_from - log_prev
+
+        if abs(h_log) < _EPS or abs(h_prev) < 1e-6:
+            return r * x + (1.0 - r) * denoised_start, None
+
+        # corr = h + 1 - exp(h) = h - expm1(h)
+        # Use a small-h series to avoid cancellation.
+        if abs(h_log) < 1e-4:
+            h2 = h_log * h_log
+            corr = -h2 * (
+                0.5
+                + h_log / 6.0
+                + h2 / 24.0
+                + h2 * h_log / 120.0
+            )
+        else:
+            corr = h_log - math.expm1(h_log)
+
+        # Apply stability clamping to prevent oversaturation
+        corr = _clamp_correction_factor(corr, h_log, h_prev)
+
+        correction = (corr / h_prev) * (denoised_start - prev_denoised)
+        x_next = r * x + (1.0 - r) * denoised_start + correction
+        return x_next, None
+
     raise ValueError(f"Unknown ODE integration method: {method}")
 
 
@@ -586,7 +696,7 @@ def _integrate(
         start_denoised = denoised_cached
         start_sigma = points[j]
 
-        if method == "dpmpp_2m":
+        if method == "dpmpp_2m" or method == "dpmpp_2m_stable":
             pdn = local_prev_denoised
             pds = local_prev_denoised_sigma
         else:
@@ -958,7 +1068,7 @@ def sample_euler_a2(
     prev_derivative = None
     prev_sigma = None
 
-    # Multistep state for dpmpp_2m.
+    # Multistep state for dpmpp_2m and dpmpp_2m_stable.
     prev_denoised = None
     prev_denoised_sigma = None
 
@@ -1056,7 +1166,7 @@ def sample_euler_a2(
                 start_denoised = denoised_cached
                 start_sigma = points[j]
 
-                if method == "dpmpp_2m":
+                if method == "dpmpp_2m" or method == "dpmpp_2m_stable":
                     pdn = local_prev_denoised
                     pds = local_prev_denoised_sigma
                 else:
@@ -1139,8 +1249,8 @@ def sample_euler_a2(
             substep_spacing,
             prev_derivative,
             prev_sigma,
-            prev_denoised if method == "dpmpp_2m" else None,
-            prev_denoised_sigma if method == "dpmpp_2m" else None,
+            prev_denoised if method == "dpmpp_2m" or method == "dpmpp_2m_stable" else None,
+            prev_denoised_sigma if method == "dpmpp_2m" or method == "dpmpp_2m_stable" else None,
         )
 
         prev_derivative = current_derivative
@@ -1374,7 +1484,8 @@ class EulerA2Sampler:
                             "midpoint/ralston/heun/dpm2: 2nd order. "
                             "rk3: 3rd order. rk4: 4th order. ab2: multistep 2nd order. "
                             "er_sde: exponential Rosenbrock-style (2nd order). "
-                            "dpmpp_2m: DPM-Solver++ 2M multistep exponential integrator."
+                            "dpmpp_2m: DPM-Solver++ 2M multistep exponential integrator. "
+                            "dpmpp_2m_stable: stabilized variant with adaptive damping to reduce oversaturation."
                         ),
                     },
                 ),
