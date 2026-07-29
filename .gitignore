@@ -28,14 +28,12 @@ dist/
 build/
 target/
 
-# Testing
+# Coverage
 .coverage
+coverage/
 htmlcov/
-.coverage.*
+
+# Testing
 .pytest_cache/
 .mypy_cache/
-
-# OS
-.DS_Store
-Thumbs.db
 ```
