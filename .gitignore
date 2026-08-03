@@ -1,3 +1,45 @@
-(nodes.py is a source file, so no additional ignores are needed beyond what's already in the current .gitignore, which appears to be empty)
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-(empty - output nothing)
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Build artifacts
+dist/
+build/
+target/
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# MyPy
+.mypy_cache/
+
+# PyTest
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+```
