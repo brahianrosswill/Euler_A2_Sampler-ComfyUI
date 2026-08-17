@@ -8,7 +8,6 @@ On top of that it supports:
 
 Higher-order integration of the deterministic down-step:
     euler              1st order, 1 evaluation
-    euler_enhanced     Euler with 15% accuracy improvement via correction term, 1 eval
     er_sde_first_order 1st order exponential Rosenbrock, 1 evaluation
     midpoint           2nd order, 2 evaluations
     ralston            2nd order, 2 evaluations
@@ -80,7 +79,6 @@ NORMALIZE_MODES = (
 )
 METHODS = (
     "euler",
-    "euler_enhanced",
     "er_sde_first_order",
     "midpoint",
     "ralston",
@@ -535,72 +533,6 @@ def _ode_step(
     if method == "euler":
         r = sigma_to / sigma_from if sigma_to > 0.0 else 0.0
         return r * x + (1.0 - r) * denoised_start, None
-
-    if method == "euler_enhanced":
-        # Enhanced Euler with improved denoising via curvature-aware correction.
-        #
-        # For the ODE dx/dsigma = (x - D)/sigma, the standard Euler has local
-        # truncation error O(h^2). The enhanced version adds a correction term
-        # that accounts for the curvature of the denoising trajectory.
-        #
-        # Unlike the previous empirical approach, this formulation:
-        # 1. Uses the actual second-order Taylor expansion term
-        # 2. Damps the correction to prevent noise amplification
-        # 3. Adapts the correction strength based on sigma regime
-        #
-        # The correction is derived from:
-        #   x(sigma + h) = x(sigma) + h * f(sigma, x) + (h^2/2) * f'(sigma, x) + ...
-        #
-        # where f(sigma, x) = (x - D(x, sigma)) / sigma
-        #
-        # Key insight: The derivative f' depends on how D changes along the
-        # trajectory. We approximate this using the direction (x - D), which
-        # captures the dominant curvature component.
-        
-        r = sigma_to / sigma_from if sigma_to > 0.0 else 0.0
-        h = sigma_to - sigma_from
-        
-        # Standard Euler prediction (exact for constant D)
-        x_pred = r * x + (1.0 - r) * denoised_start
-        
-        if sigma_to <= _EPS or abs(h) < _EPS:
-            return x_pred, None
-        
-        # Compute the displacement vector (direction of denoising)
-        displacement = x_pred - x
-        
-        # Curvature-aware correction with adaptive damping
-        # The correction strength decreases as we approach sigma=0 to prevent
-        # instability in the final denoising stages
-        sigma_ratio = sigma_to / sigma_from if sigma_from > _EPS else 0.0
-        
-        # Base correction coefficient from Taylor expansion: h^2 / (2 * sigma_from^2)
-        # This comes from the second derivative term of the ODE
-        base_coeff = 0.5 * (h / sigma_from) ** 2
-        
-        # Adaptive damping factor:
-        # - High sigma (>1): reduce correction to preserve coarse structure
-        # - Mid sigma (0.1-1): full correction for balanced denoising  
-        # - Low sigma (<0.1): reduce correction to prevent noise amplification
-        if sigma_from > 1.0:
-            damping = 0.5 / sigma_from
-        elif sigma_from > 0.1:
-            damping = 1.0
-        else:
-            damping = sigma_from / 0.1
-        
-        # Apply smooth clamping to prevent excessive correction
-        damping = max(0.1, min(1.0, damping))
-        
-        # Final correction with damping
-        correction = base_coeff * damping * displacement
-        
-        # Apply correction: move slightly toward the denoised direction
-        # The negative sign ensures we're correcting TOWARD the solution,
-        # not away from it (which would add noise)
-        x_next = x_pred - correction
-        
-        return x_next, None
 
     if method == "er_sde_first_order":
         # First-order exponential Rosenbrock integrator for SDE/ODE.
@@ -1754,7 +1686,7 @@ class EulerA2Sampler:
                         "default": "euler",
                         "tooltip": (
                             "Integration method for deterministic down-step. "
-                            "euler: standard 1st order. euler_enhanced: Euler with 15%% accuracy improvement via correction term. "
+                            "euler: standard 1st order. "
                             "er_sde_first_order: 1st order exponential Rosenbrock. "
                             "midpoint/ralston/heun/dpm2: 2nd order. "
                             "rk3: 3rd order. rk4: 4th order. ab2: multistep 2nd order. "
