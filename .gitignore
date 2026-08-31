@@ -1,16 +1,18 @@
 ```
-# Python
+# Compiled Python files
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
+
+# Dependencies
+.venv/
+venv/
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
 
-# Environment
+# Environment files
 .env
 .env.local
 *.env.*
@@ -18,14 +20,4 @@ __pycache__/
 # Editors
 .vscode/
 .idea/
-
-# Dependencies
-.venv/
-venv/
-node_modules/
-
-# Build artifacts
-dist/
-build/
-target/
 ```

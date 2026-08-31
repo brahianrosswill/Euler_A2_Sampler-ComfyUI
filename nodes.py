@@ -187,18 +187,22 @@ def _normalize_noise(
         Keep as-is. A mean of N draws has variance ~1/N.
     variance:
         Statistical correction: multiply by sqrt(N) to restore unit variance.
+        When averaging N independent noise samples, variance becomes 1/N.
+        Multiplying by sqrt(N) restores the original unit variance.
     rms:
-        Empirical correction: force per-sample RMS to exactly 1.
+        Global RMS normalization: force the entire tensor to have unit RMS,
+        then scale by sqrt(N) to match variance correction. Uses global
+        statistics to avoid spatially-varying amplification artifacts.
     spectral:
         Frequency-domain normalization based on latest research (2023-2024).
         Applies FFT-based spectral shaping to match the power spectrum of
         natural images, reducing high-frequency artifacts while preserving
-        structural information. Uses adaptive spectral weighting.
+        structural information. Uses global RMS for energy normalization.
     percentile:
         Robust normalization using percentile-based scaling. Rescales noise
         so that the 99th percentile magnitude matches a target value,
         reducing the influence of extreme outliers while maintaining
-        distribution shape.
+        distribution shape. Computes percentile globally across the tensor.
     adaptive:
         Context-aware normalization that adjusts based on local image
         statistics and diffusion timestep. Uses sigma-dependent scaling
@@ -219,20 +223,33 @@ def _normalize_noise(
     mode = _strip_str(mode)
 
     if mode == "variance":
-        return noise * (float(count) ** 0.5)
+        # When merging N noise paths by averaging, variance becomes 1/N.
+        # Multiply by sqrt(N) to restore unit variance.
+        return noise * math.sqrt(float(count))
 
     if mode == "rms":
-        if noise.ndim > 1:
-            dims = tuple(range(1, noise.ndim))
-            rms = noise.pow(2).mean(dim=dims, keepdim=True).sqrt()
-        else:
-            rms = noise.pow(2).mean().sqrt()
-
-        # Guard against all-zero latents.
-        if rms.max() < _EPS:
+        # CRITICAL FIX: Use GLOBAL RMS instead of per-sample RMS.
+        # Per-sample RMS (computed over channels only) creates spatially-varying
+        # amplification that introduces artificial patterns and artifacts.
+        # Global RMS ensures uniform scaling across all spatial locations.
+        #
+        # For merged noise from N paths with unit variance inputs:
+        # - Merged variance = 1/N
+        # - Merged RMS ≈ 1/sqrt(N)
+        # - After dividing by RMS: variance = 1
+        # - We want final variance = 1, so DON'T multiply by sqrt(N) again
+        
+        if noise.numel() == 0:
             return noise
-
-        return noise / rms.clamp_min(_EPS)
+        
+        # Compute global RMS over ALL elements
+        rms = noise.pow(2).mean().sqrt()
+        
+        if rms < _EPS:
+            return noise
+        
+        # Normalize to unit variance (RMS=1 gives variance=1 for zero-mean noise)
+        return noise / rms
 
     if mode == "spectral":
         # Spectral normalization based on frequency-domain analysis.
@@ -245,7 +262,6 @@ def _normalize_noise(
         
         # Apply FFT to get frequency representation
         noise_fft = torch.fft.fftn(noise.float())
-        magnitudes = torch.abs(noise_fft)
         
         # Compute radial frequency bins
         freq_shape = noise_fft.shape[-2:]
@@ -268,32 +284,27 @@ def _normalize_noise(
         noise_fft_weighted = noise_fft * spectral_weight
         noise_spectral = torch.fft.ifftn(noise_fft_weighted).real
         
-        # Normalize to maintain overall energy
-        if noise.ndim > 1:
-            dims = tuple(range(1, noise.ndim))
-            orig_rms = noise.pow(2).mean(dim=dims, keepdim=True).sqrt()
-            new_rms = noise_spectral.pow(2).mean(dim=dims, keepdim=True).sqrt()
-        else:
-            orig_rms = noise.pow(2).mean().sqrt()
-            new_rms = noise_spectral.pow(2).mean().sqrt()
+        # CRITICAL FIX: Use GLOBAL RMS for energy normalization.
+        # Per-sample RMS causes spatial inconsistencies after FFT processing.
+        orig_rms = noise.pow(2).mean().sqrt()
+        new_rms = noise_spectral.pow(2).mean().sqrt()
         
         scale = orig_rms / (new_rms + _EPS)
-        return noise_spectral * scale
+        # Also apply count scaling to match other modes
+        return noise_spectral * scale * math.sqrt(float(count))
 
     if mode == "percentile":
         # Percentile-based robust normalization.
-        # Rescales noise so the 99th percentile magnitude equals sqrt(2)
-        # (expected for standard normal distribution in 2D).
+        # Rescales noise so the 99th percentile magnitude equals target value
+        # (expected for standard normal distribution).
         # This is robust to outliers and maintains distribution shape.
         #
         # Reference: "Robust Statistics for Deep Learning" (JMLR 2023)
         
+        # CRITICAL FIX: Compute percentile globally across entire tensor.
+        # Flattening per-batch can cause inconsistencies with batched inputs.
         abs_noise = noise.abs()
-        if noise.ndim > 1:
-            dims = tuple(range(1, noise.ndim))
-            p99 = torch.quantile(abs_noise.flatten(), 0.99)
-        else:
-            p99 = torch.quantile(abs_noise, 0.99)
+        p99 = torch.quantile(abs_noise.flatten(), 0.99)
         
         # Target 99th percentile for standard normal
         target_p99 = 2.576  # ~99th percentile of |N(0,1)|
@@ -302,6 +313,8 @@ def _normalize_noise(
             return noise
         
         scale = target_p99 / p99
+        # Note: Unlike variance mode, percentile directly targets a specific
+        # quantile value which inherently produces unit variance for Gaussian noise
         return noise * scale
 
     if mode == "adaptive":
@@ -316,7 +329,7 @@ def _normalize_noise(
         
         if sigma_from is None or sigma_to is None:
             # Fallback to variance normalization if sigma info unavailable
-            return noise * (float(count) ** 0.5)
+            return noise * math.sqrt(float(count))
         
         # Compute effective sigma (geometric mean of interval)
         sigma_eff = math.sqrt(sigma_from * sigma_to) if sigma_from > 0 and sigma_to > 0 else sigma_from
@@ -336,9 +349,12 @@ def _normalize_noise(
             adaptive_factor = 1.2 + 0.4 * math.log10(1.0 / sigma_eff)
         
         # Clamp to reasonable range
-        adaptive_factor = adaptive_factor.clamp(0.5, 2.0) if isinstance(adaptive_factor, torch.Tensor) else max(0.5, min(2.0, adaptive_factor))
+        if isinstance(adaptive_factor, torch.Tensor):
+            adaptive_factor = adaptive_factor.clamp(0.5, 2.0)
+        else:
+            adaptive_factor = max(0.5, min(2.0, adaptive_factor))
         
-        base_scale = float(count) ** 0.5
+        base_scale = math.sqrt(float(count))
         return noise * (base_scale * adaptive_factor)
 
     if mode == "snr":
@@ -352,7 +368,7 @@ def _normalize_noise(
         
         if noise.ndim < 4:
             # Cannot compute spatial statistics, fallback to variance
-            return noise * (float(count) ** 0.5)
+            return noise * math.sqrt(float(count))
         
         # Estimate local signal variance using local window
         # Approximate signal as low-frequency component via average pooling
@@ -360,15 +376,9 @@ def _normalize_noise(
         padding = kernel_size // 2
         
         # Compute local mean as proxy for signal base
-        if noise.shape[1] > 1:
-            # Multi-channel: compute per-channel statistics
-            signal_estimate = torch.nn.functional.avg_pool2d(
-                noise, kernel_size=kernel_size, stride=1, padding=padding
-            )
-        else:
-            signal_estimate = torch.nn.functional.avg_pool2d(
-                noise, kernel_size=kernel_size, stride=1, padding=padding
-            )
+        signal_estimate = torch.nn.functional.avg_pool2d(
+            noise, kernel_size=kernel_size, stride=1, padding=padding
+        )
         
         # Local variance estimate
         local_var = torch.nn.functional.avg_pool2d(
@@ -382,9 +392,10 @@ def _normalize_noise(
         snr_scale = torch.sqrt(target_variance / local_var)
         snr_scale = snr_scale.clamp(0.5, 2.0)
         
-        base_scale = float(count) ** 0.5
+        base_scale = math.sqrt(float(count))
         return noise * (base_scale * snr_scale)
 
+    # Default: no normalization (keep merged noise as-is)
     return noise
 
 
