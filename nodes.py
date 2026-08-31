@@ -222,9 +222,12 @@ def _normalize_noise(
         return noise * (float(count) ** 0.5)
 
     if mode == "rms":
-        if noise.ndim > 1:
-            dims = tuple(range(1, noise.ndim))
-            rms = noise.pow(2).mean(dim=dims, keepdim=True).sqrt()
+        # RMS normalization over spatial dimensions only to preserve
+        # batch/channel independence and avoid cross-channel artifacts
+        spatial_dims = tuple(range(noise.ndim - 2, noise.ndim)) if noise.ndim >= 2 else None
+        
+        if spatial_dims is not None:
+            rms = noise.pow(2).mean(dim=spatial_dims, keepdim=True).sqrt()
         else:
             rms = noise.pow(2).mean().sqrt()
 
@@ -243,57 +246,63 @@ def _normalize_noise(
         #   - "Spectral Diffusion: Frequency-Aware Noise Scheduling" (ICLR 2024)
         #   - "Fourier Features Let Networks Learn High Frequency Functions" (NeurIPS 2023)
         
-        # Apply FFT to get frequency representation
-        noise_fft = torch.fft.fftn(noise.float())
-        magnitudes = torch.abs(noise_fft)
+        # Preserve original dtype and device
+        orig_dtype = noise.dtype
+        noise_float = noise.float()
         
-        # Compute radial frequency bins
-        freq_shape = noise_fft.shape[-2:]
-        cy, cx = freq_shape[0] // 2, freq_shape[1] // 2
+        # Compute spatial dimensions only (last two dims)
+        spatial_shape = noise_float.shape[-2:]
+        H, W = spatial_shape
+        
+        # Apply FFT over spatial dimensions only
+        noise_fft = torch.fft.fftn(noise_float, dim=(-2, -1))
+        
+        # Compute radial frequency bins for spatial dimensions
+        cy, cx = H // 2, W // 2
         y, x = torch.meshgrid(
-            torch.arange(freq_shape[0], device=noise.device, dtype=torch.float32),
-            torch.arange(freq_shape[1], device=noise.device, dtype=torch.float32),
+            torch.arange(H, device=noise.device, dtype=torch.float32),
+            torch.arange(W, device=noise.device, dtype=torch.float32),
             indexing='ij'
         )
         radius = torch.sqrt((x - cx) ** 2 + (y - cy) ** 2)
         max_radius = torch.sqrt(torch.tensor(cx**2 + cy**2, device=noise.device, dtype=torch.float32))
         normalized_radius = radius / (max_radius + _EPS)
         
-        # Apply spectral weighting: emphasize mid-frequencies, attenuate extremes
+        # Apply spectral weighting: gentle low-pass to reduce high-frequency artifacts
         # Based on natural image power spectrum (~1/f characteristic)
-        spectral_weight = 1.0 / (normalized_radius + 0.1).clamp_min(_EPS)
+        # Use softer weighting to avoid introducing new artifacts
+        spectral_weight = 1.0 / (normalized_radius + 0.3).clamp_min(_EPS)
         spectral_weight = spectral_weight / spectral_weight.max()
+        
+        # Broadcast weight to match FFT shape (batch and channel dimensions preserved)
+        # noise_fft shape: [B, C, H, W] or similar
+        weight_shape = [1] * (noise_fft.ndim - 2) + list(spatial_shape)
+        spectral_weight = spectral_weight.view(weight_shape)
         
         # Apply weighting and inverse FFT
         noise_fft_weighted = noise_fft * spectral_weight
-        noise_spectral = torch.fft.ifftn(noise_fft_weighted).real
+        noise_spectral = torch.fft.ifftn(noise_fft_weighted, dim=(-2, -1)).real
         
-        # Normalize to maintain overall energy
-        if noise.ndim > 1:
-            dims = tuple(range(1, noise.ndim))
-            orig_rms = noise.pow(2).mean(dim=dims, keepdim=True).sqrt()
-            new_rms = noise_spectral.pow(2).mean(dim=dims, keepdim=True).sqrt()
-        else:
-            orig_rms = noise.pow(2).mean().sqrt()
-            new_rms = noise_spectral.pow(2).mean().sqrt()
+        # Normalize to maintain overall energy - compute over spatial dims only
+        # to preserve batch/channel independence
+        spatial_dims = tuple(range(noise.ndim - 2, noise.ndim))
+        orig_rms = noise_float.pow(2).mean(dim=spatial_dims, keepdim=True).sqrt()
+        new_rms = noise_spectral.pow(2).mean(dim=spatial_dims, keepdim=True).sqrt()
         
         scale = orig_rms / (new_rms + _EPS)
-        return noise_spectral * scale
+        return (noise_spectral * scale).to(orig_dtype)
 
     if mode == "percentile":
         # Percentile-based robust normalization.
-        # Rescales noise so the 99th percentile magnitude equals sqrt(2)
-        # (expected for standard normal distribution in 2D).
-        # This is robust to outliers and maintains distribution shape.
+        # Rescales noise so the 99th percentile magnitude matches expected value
+        # for standard normal distribution. This is robust to outliers and 
+        # maintains distribution shape.
         #
         # Reference: "Robust Statistics for Deep Learning" (JMLR 2023)
         
         abs_noise = noise.abs()
-        if noise.ndim > 1:
-            dims = tuple(range(1, noise.ndim))
-            p99 = torch.quantile(abs_noise.flatten(), 0.99)
-        else:
-            p99 = torch.quantile(abs_noise, 0.99)
+        # Compute percentile over all elements for consistent scaling
+        p99 = torch.quantile(abs_noise.flatten(), 0.99)
         
         # Target 99th percentile for standard normal
         target_p99 = 2.576  # ~99th percentile of |N(0,1)|
@@ -335,8 +344,8 @@ def _normalize_noise(
             # Late denoising: enhanced noise for details
             adaptive_factor = 1.2 + 0.4 * math.log10(1.0 / sigma_eff)
         
-        # Clamp to reasonable range
-        adaptive_factor = adaptive_factor.clamp(0.5, 2.0) if isinstance(adaptive_factor, torch.Tensor) else max(0.5, min(2.0, adaptive_factor))
+        # Clamp to reasonable range - prevent excessive amplification/attenuation
+        adaptive_factor = max(0.5, min(2.0, adaptive_factor))
         
         base_scale = float(count) ** 0.5
         return noise * (base_scale * adaptive_factor)
@@ -359,28 +368,23 @@ def _normalize_noise(
         kernel_size = 7
         padding = kernel_size // 2
         
-        # Compute local mean as proxy for signal base
-        if noise.shape[1] > 1:
-            # Multi-channel: compute per-channel statistics
-            signal_estimate = torch.nn.functional.avg_pool2d(
-                noise, kernel_size=kernel_size, stride=1, padding=padding
-            )
-        else:
-            signal_estimate = torch.nn.functional.avg_pool2d(
-                noise, kernel_size=kernel_size, stride=1, padding=padding
-            )
+        # Compute local mean as proxy for signal base (per-channel)
+        signal_estimate = torch.nn.functional.avg_pool2d(
+            noise, kernel_size=kernel_size, stride=1, padding=padding
+        )
         
-        # Local variance estimate
+        # Local variance estimate (per-channel)
         local_var = torch.nn.functional.avg_pool2d(
             noise ** 2, kernel_size=kernel_size, stride=1, padding=padding
         ) - signal_estimate ** 2
         local_var = local_var.clamp_min(_EPS)
         
-        # SNR-adaptive scaling: higher scaling where local variance is low
-        # (smooth regions need more careful noise injection)
+        # SNR-adaptive scaling: normalize to global variance target
+        # This prevents spatial regions from having wildly different noise levels
         target_variance = local_var.mean()
         snr_scale = torch.sqrt(target_variance / local_var)
-        snr_scale = snr_scale.clamp(0.5, 2.0)
+        # Clamp more conservatively to prevent artifacts
+        snr_scale = snr_scale.clamp(0.7, 1.5)
         
         base_scale = float(count) ** 0.5
         return noise * (base_scale * snr_scale)
